@@ -220,32 +220,54 @@ pub(super) fn spawn_loader(
     let handle = std::thread::Builder::new()
         .name("resource-loader".into())
         .spawn(move || {
-            let mut pack_error = None;
-            let root = packs::startup_root(&vanilla_root, &settings.resource_packs, &[])
-                .unwrap_or_else(|error| {
-                    pack_error = Some(error.to_string());
-                    vanilla_root.clone()
-                });
-            let root = mods::content_root(&root, &settings.mods.enabled, &dev_mods);
-            let result = load_resources(
-                root,
-                &vanilla_root,
-                &settings,
-                started,
-                true,
-                &progress,
-                &mut |gui, root| {
-                    let _ = sender.send(LoaderMsg::Ui(gui, root.to_path_buf()));
-                },
-            )
-            .map(|mut loaded| {
-                loaded.pack_error = loaded.pack_error.or(pack_error);
-                loaded
-            })
-            .map_err(|error| error.to_string());
+            let result = run_loader(|| {
+                let mut pack_error = None;
+                let root = packs::startup_root(&vanilla_root, &settings.resource_packs, &[])
+                    .unwrap_or_else(|error| {
+                        pack_error = Some(error.to_string());
+                        vanilla_root.clone()
+                    });
+                let root = mods::content_root(&root, &settings.mods.enabled, &dev_mods);
+                load_resources(
+                    root,
+                    &vanilla_root,
+                    &settings,
+                    started,
+                    true,
+                    &progress,
+                    &mut |gui, root| {
+                        let _ = sender.send(LoaderMsg::Ui(gui, root.to_path_buf()));
+                    },
+                )
+                .map(|mut loaded| {
+                    loaded.pack_error = loaded.pack_error.or(pack_error);
+                    loaded
+                })
+                .map_err(|error| error.to_string())
+            });
             let _ = sender.send(LoaderMsg::Done(result));
         })?;
     Ok((receiver, handle))
+}
+
+/// Runs the loader body, turning a panic into a load error. A loader that dies
+/// without sending `Done` reaches the player as "resource loader stopped before
+/// finishing", which names no cause; the panic message at least says what broke.
+fn run_loader(
+    body: impl FnOnce() -> std::result::Result<Loaded, String>,
+) -> std::result::Result<Loaded, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+        .unwrap_or_else(|payload| Err(loader_panic(&*payload)))
+}
+
+/// The text of a panic payload, as the panic hook would have formatted it.
+fn loader_panic(payload: &(dyn std::any::Any + Send)) -> String {
+    let text = payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".into());
+    format!("the resource loader panicked: {text}")
 }
 
 impl Loading {
@@ -263,7 +285,11 @@ impl Loading {
                         if let Some(handle) = self.handle.take() {
                             let _ = handle.join();
                         }
-                        return Err("resource loader stopped before finishing".into());
+                        return Err(format!(
+                            "resource loader stopped before finishing ({})",
+                            self.progress.line()
+                        )
+                        .into());
                     }
                 }
             }
@@ -787,7 +813,18 @@ mod tests {
         let mut loading = loading(receiver);
         assert_eq!(
             loading.poll_menu_resources().unwrap_err().to_string(),
-            "resource loader stopped before finishing"
+            "resource loader stopped before finishing (Loading menu)"
+        );
+    }
+
+    #[test]
+    fn a_loader_panic_names_its_cause_instead_of_dying_silently() {
+        let Err(error) = run_loader(|| panic!("the pack table has no stone")) else {
+            panic!("a panicking loader reports an error");
+        };
+        assert_eq!(
+            error,
+            "the resource loader panicked: the pack table has no stone"
         );
     }
 }
